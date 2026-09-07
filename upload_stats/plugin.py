@@ -10,6 +10,7 @@ the statistics page periodically.
 .. seealso:: :class:`npc.BasePlugin` for more information about the plugin class.
 """
 
+import gzip
 import json
 import sys
 import webbrowser
@@ -59,6 +60,7 @@ class Plugin(BasePlugin):
         stats (:obj:`upload_stats.Stats`): Statistics data
         empty_stats (:obj:`upload_stats.Stats`): Empty statistics data
         auto_builder (:obj:`upload_stats.npc.PeriodicJob`): Auto builder job
+        auto_backup (:obj:`upload_stats.npc.PeriodicJob`): Auto backup job
     """
 
     class Config(BasePlugin.Config):
@@ -73,7 +75,8 @@ class Plugin(BasePlugin):
             stats_html_file (:obj:`pathlib.Path`): Path to statistics HTML file
             playlist_file (:obj:`pathlib.Path`): Path to playlist file
             backup_folder (:obj:`pathlib.Path`): Path to backup folder
-            backup_interval (:obj:`int`): Auto backup interval
+            backup_interval (:obj:`int`): Auto backup interval in hours
+            backup_retention (:obj:`int`): Backup retention time in days
             build_interval (:obj:`int`): Rebuild interval
             dark_theme (:obj:`bool`): Dark theme
             auto_refresh (:obj:`bool`): Auto refresh
@@ -92,8 +95,10 @@ class Plugin(BasePlugin):
         )
 
         backup_folder = File("Path to backup folder", default=BUILD_PATH / "backups")
-        backup_interval = Int("Auto backup every x hours", default=24)
-        build_interval = Int("Rebuild statistics page every x minutes", default=30)
+        backup_interval = Int("Auto backup every x hours", default=24, minimum=1)
+        backup_retention = Int("How long to keep backups (in days)", default=30)
+
+        build_interval = Int("Rebuild statistics page every x minutes", default=30, minimum=1)
 
         dark_theme = Bool("Dark Theme", default=True)
         auto_refresh = Bool("Auto refresh statistics page", default=False)
@@ -141,7 +146,7 @@ class Plugin(BasePlugin):
             update=self.rebuild_stats_output,
         )
         self.auto_backup = PeriodicJob(
-            name="AutoBuilder",
+            name="AutoBackup",
             delay=lambda: self.config.backup_interval * 3600,
             update=self.automatic_backup,
         )
@@ -168,31 +173,27 @@ class Plugin(BasePlugin):
         except json.JSONDecodeError:
             self.log.exception(f'Could not parse statistics file "{self.config.stats_file}".')
             self.window(
-                dedent(
-                    f"""
+                dedent(f"""
                 Corrupted statistics file "{self.config.stats_file}".
 
                 Use /up-restore to restor the latest backup or /up-reset to reset the statistics.
 
                 If the error persists, please contact create an issue on GitHub, with the text in the console.
                 https://github.com/Nachtalb/more-upload-stats/issues
-                """
-                ),
+                """),
                 title="Corrupted statistics file",
             )
         except Exception as e:
             self.log.exception(f'Could not load statistics from "{self.config.stats_file}": {e}')
             self.window(
-                dedent(
-                    f"""
+                dedent(f"""
                 Could not load statistics from "{self.config.stats_file}".
 
                 Use /up-restore to restor the latest backup or /up-reset to reset the statistics.
 
                 If the error persists, please contact create an issue on GitHub, with the text in the console.
                 https://github.com/Nachtalb/more-upload-stats/issues
-                """
-                ),
+                """),
                 title="Error loading statistics",
             )
         return False
@@ -205,19 +206,28 @@ class Plugin(BasePlugin):
         if hasattr(self, "auto_backup"):
             self.auto_backup.pause()
 
-    def save_stats(self, path: Optional[Path] = None) -> None:
+    def save_stats(self, path: Optional[Path] = None, compressed: bool = False) -> None:
         """Save the statistics to a file
 
         Args:
             path (:obj:`pathlib.Path`, optional): Path to the file. Default is None.
         """
         path = path or self.config.stats_file
+        if compressed:
+            path = path.with_suffix(path.suffix + ".gz")
+
         self.log.debug(f'Saving statistics to "{path}"')
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
             self.log.debug(f'Created missing file "{path}"')
-        path.write_text(json.dumps(self.stats, ensure_ascii=False), encoding="utf-8")
+
+        content = json.dumps(self.stats, ensure_ascii=False).encode("utf-8")
+        if compressed:
+            with gzip.open(path, mode="wb") as gzip_file:
+                gzip_file.write(content)
+        else:
+            path.write_bytes(content)
         self.log.debug(f'Saved statistics to "{path}"')
 
     @command
@@ -225,8 +235,7 @@ class Plugin(BasePlugin):
         """Start the reset process"""
         self.log.warning("User requested a reset, asking for confirmation.")
         self.window(
-            dedent(
-                """
+            dedent("""
                 Are you sure you want to reset the statistics?
 
                 Before the reset is performed, a backup will be created.
@@ -234,8 +243,7 @@ class Plugin(BasePlugin):
 
                 Confirm the reset by using /up-reset-confirm
                 Abort the reset by using /up-reset-abort
-                """
-            ),
+                """),
             title="Reset Statistics",
         )
         self.reset_flag = True
@@ -258,6 +266,20 @@ class Plugin(BasePlugin):
         self.backup("reset")
         self.hard_reset()
 
+    def delete_old_backups(self) -> None:
+        """Delete backups older than :attr:`upload_stats.Plugin.Config.backup_retention`
+
+        Note:
+
+            Existing `*.json` backups are not auto deleted to ensure the users looses no data.
+
+        """
+        self.log.debug("Deleting old backups")
+        for file in self.config.backup_folder.glob("stats*.gz"):
+            if (datetime.now().second - file.stat().st_mtime) > (self.config.backup_retention * 24 * 60 * 60):
+                self.log.debug(f'Deleting old backup "{file}"')
+                file.unlink()
+
     def backup(self, reason: str) -> Path:
         """Create a backup of the statistics
 
@@ -269,7 +291,7 @@ class Plugin(BasePlugin):
         """
         self.log.info(f'Creating a backup for "{reason}"')
         file = self.config.backup_folder / (f"stats-{reason}-{datetime.now().strftime('%Y_%M_%d-%H_%M_%S')}.json")
-        self.save_stats(file)
+        self.save_stats(file, compressed=True)
         self.log.info(f'Created a backup at "{file}"')
         return file
 
@@ -286,6 +308,8 @@ class Plugin(BasePlugin):
         """Trigger an automatic backup"""
         self.log.info("Automatic backup triggered")
         self.backup("auto")
+        if self.config.backup_retention > 0:
+            self.delete_old_backups()
 
     @command(aliases=["stats"])
     def open(self) -> None:
@@ -339,9 +363,6 @@ class Plugin(BasePlugin):
         Args:
             file (:obj:`str`, optional): Backup file to restore. Default is None.
         """
-        # Backup current stats
-        new_backup = self.backup("restore")
-
         # Choose backup file
         if file:
             file = Path(file)
@@ -353,9 +374,8 @@ class Plugin(BasePlugin):
                     return
             self.log.info(f'Restoring backup "{file}"')
         else:
-            backups: List[Path] = list(self.config.backup_folder.glob("stats-*.json"))
+            backups: List[Path] = list(self.config.backup_folder.glob("stats-*.json*"))
             backups = sorted(backups, reverse=True, key=lambda i: i.stat().st_mtime)
-            backups = [file for file in backups if file != new_backup]
 
             if not backups:
                 self.log.error("No backups found")
@@ -365,9 +385,20 @@ class Plugin(BasePlugin):
             file = backups[0]
             self.log.info(f'Restoring backup "{file}"')
 
+        # Backup current stats
+        self.backup("restore")
+
         # Restore backup
         try:
-            self.stats = json.loads(file.read_text(encoding="utf-8"))
+            if file.suffix == ".gz":
+                with gzip.open(file, "rt", encoding="utf-8") as f:
+                    self.stats = json.loads(f.read())
+            elif file.suffix == ".json":
+                self.stats = json.loads(file.read_text(encoding="utf-8"))
+            else:
+                self.log.error(f'Unsupported backup file "{file}"')
+                self.window(f'Unsupported backup file "{file}"', title="Error")
+                return
         except json.JSONDecodeError:
             self.log.error(f'Could not parse backup file "{file}"')
             self.window(f'Could not parse backup file "{file}"', title="Error")
@@ -384,8 +415,8 @@ class Plugin(BasePlugin):
 
     def rebuild_stats_output(self) -> None:
         """Rebuild the statistics page and playlist file"""
-        self.rebuild_page()
         self.rebuild_playlist()
+        self.rebuild_page()
 
     @command("rebuild", parameters=["[user threshold]", "[file threshold]"])
     def rebuild_stats_output_cmd(
@@ -397,8 +428,8 @@ class Plugin(BasePlugin):
             user_threshold (:obj:`int`, optional): User threshold
             file_threshold (:obj:`int`, optional): File threshold
         """
-        self.rebuild_page(user_threshold, file_threshold)
         self.rebuild_playlist()
+        self.rebuild_page(user_threshold, file_threshold)
 
     @command("rebuild-page", parameters=["[user threshold]", "[file threshold]"])
     def rebuild_page_cmd(self, user_threshold: Optional[int] = None, file_threshold: Optional[int] = None) -> None:
@@ -615,7 +646,7 @@ class Plugin(BasePlugin):
             filename = a(
                 Path(user_data["last_file"]).name,
                 href="#file-" + id_string(user_data["last_real_file"]),
-                data_tooltip=f'RP: {user_data["last_real_file"]}\nVP: {user_data["last_file"]}',
+                data_tooltip=f"RP: {user_data['last_real_file']}\nVP: {user_data['last_file']}",
                 data_tooltip_align="left",
             )
 
@@ -670,7 +701,7 @@ class Plugin(BasePlugin):
 
             name = a(
                 Path(file_path).name,
-                data_tooltip=f'RP: {file_path}\nVP: {file_data["virtual_path"]}',
+                data_tooltip=f"RP: {file_path}\nVP: {file_data['virtual_path']}",
                 href="file:///" + file_path,
                 target="_blank",
                 data_tooltip_align="left",
@@ -776,10 +807,7 @@ class Plugin(BasePlugin):
 
     def pre_stop(self) -> None:
         """Stop all jobs before stopping the plugin"""
-        self.log.debug("Stopping all jobs")
         self.backup("stop")
-        self.auto_update.stop()
-        self.auto_builder.stop(False)
 
     def upload_finished_notification(self, user: str, virtual_path: str, real_path: str) -> None:
         """Event: Upload finished
